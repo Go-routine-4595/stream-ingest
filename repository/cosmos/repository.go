@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"githb.com/Go-routine-4595/stream-ingest/domain/stream"
+	"net/http"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/data/azcosmos"
 	"github.com/rs/zerolog/log"
@@ -129,6 +130,89 @@ func (r Repository) CreatStreamsByStreamKey(streams []stream.Stream) []error {
 	}
 
 	return errs
+}
+
+func (r Repository) CreatBatchedStreamsByStreamKey(streams []stream.Stream) []error {
+	var errs []error
+
+	batches, _, err := makeBatches(streams, 100)
+	if err != nil {
+		return []error{err}
+	}
+
+	for site, batch := range batches {
+		pk := azcosmos.NewPartitionKeyString(site)
+		batchDB := r.Container.NewTransactionalBatch(pk)
+		for _, item := range batch {
+			batchDB.CreateItem(item, nil)
+		}
+
+		ctx := context.TODO()
+
+		resp, err := r.Container.ExecuteTransactionalBatch(ctx, batchDB, nil)
+		if err != nil {
+			return []error{err}
+		}
+		for _, op := range resp.OperationResults {
+			if op.StatusCode != http.StatusCreated {
+				lerr := errors.Join(errors.New("failed to create item in repository CreatBatchedStreamsByStreamKey"), err)
+				errs = append(errs, lerr)
+			}
+		}
+	}
+
+	return errs
+}
+
+/ makeBatches groups a slice of streams by siteCode, splits them into smaller batches of the specified size, and returns:
+// - A map[string][][]byte where the key is siteCode and the value is a set of marshaled batches.
+// - A map[string][][]string where the key is siteCode and the value is a set of batches containing stream IDs.
+func makeBatches(streams []stream.Stream, batchSize int) (map[string][][]byte, map[string][][]string, error) {
+	// Step 1: Group streams by siteCode
+	grouped := make(map[string][]stream.Stream)
+	for _, streamItem := range streams {
+		grouped[streamItem.SiteCode] = append(grouped[streamItem.SiteCode], streamItem)
+	}
+
+	marshaledResults := make(map[string][][]byte)
+	idsResults := make(map[string][][]string)
+
+	// Step 2: Create batches for each siteCode
+	for siteCode, siteStreams := range grouped {
+		var marshaledBatches [][]byte
+		var idBatches [][]string
+
+		for i := 0; i < len(siteStreams); i += batchSize {
+			end := i + batchSize
+			if end > len(siteStreams) {
+				end = len(siteStreams)
+			}
+			batch := siteStreams[i:end]
+
+			// Step 3a: Marshal the batch
+			for _, item := range batch {
+
+				marshaledBatch, err := json.Marshal(item)
+				if err != nil {
+					return nil, nil, err
+				}
+				marshaledBatches = append(marshaledBatches, marshaledBatch)
+			}
+
+			// Step 3b: Extract IDs from the batch
+			var idBatch []string
+			for _, item := range batch {
+				idBatch = append(idBatch, item.ID)
+			}
+			idBatches = append(idBatches, idBatch)
+		}
+
+		// Step 4: Store results in maps
+		marshaledResults[siteCode] = marshaledBatches
+		idsResults[siteCode] = idBatches
+	}
+
+	return marshaledResults, idsResults, nil
 }
 
 func (r Repository) Close() {
