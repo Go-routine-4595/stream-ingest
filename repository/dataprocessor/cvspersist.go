@@ -58,7 +58,7 @@ func (p CSVPersist) Persist(items []model.Item) error {
 }
 
 func removeStandardTags(item *model.Item) {
-	listOfTagToRemove := []int{}
+	listOfTagToRemove := make([]int, 0)
 	for i, tag := range item.Tags {
 		if isTagInExpectedHeaders(tag.Name) {
 			listOfTagToRemove = append(listOfTagToRemove, i)
@@ -90,7 +90,7 @@ func isTagInExpectedHeaders(tag string) bool {
 }
 
 func itemToString(item model.Item) []string {
-	res := []string{}
+	res := make([]string, 0)
 
 	// Convert all fields of the struct to strings using reflection
 	v := reflect.ValueOf(item)
