@@ -2,14 +2,15 @@ package cmd
 
 import (
 	"fmt"
-	"githb.com/Go-routine-4595/stream-ingest/repository/cosmos"
-	"github.com/schollz/progressbar/v3"
 	"io"
 
 	"githb.com/Go-routine-4595/stream-ingest/domain/stream"
+	"githb.com/Go-routine-4595/stream-ingest/internal"
+	"githb.com/Go-routine-4595/stream-ingest/repository/cosmos"
 	"githb.com/Go-routine-4595/stream-ingest/repository/dataprocessor"
 
 	"github.com/rs/zerolog/log"
+	"github.com/schollz/progressbar/v3"
 	"github.com/spf13/cobra"
 )
 
@@ -36,10 +37,10 @@ func executeCheck(file string) {
 		streamRes   *stream.Stream
 		storedSteam []stream.Stream
 		reader      *dataprocessor.CSVReader
-		repo        cosmos.Repository
+		repo        *cosmos.Repository
 		lineNumber  int
 		bar         *progressbar.ProgressBar
-		logRecs     []logRecord
+		logRecs     []internal.LogRecord
 		sensorId    map[string]int
 	)
 
@@ -68,12 +69,12 @@ func executeCheck(file string) {
 				break
 			}
 			log.Logger.Err(err).Msg("Failed to read next stream")
-			logRecs = append(logRecs, logRecord{err: err, msg: fmt.Sprintf("Failed to read next stream on line: %d", i)})
+			logRecs = append(logRecs, internal.LogRecord{Err: err, Msg: fmt.Sprintf("Failed to read next stream on line: %d", i)})
 		}
 		// check is a row had the same sensorId we already processed in the file
 		// SensorID is the primaryKey
 		if _, ok := sensorId[streamRes.SensorID]; ok {
-			logRecs = append(logRecs, logRecord{err: nil, msg: fmt.Sprintf("Duplicate SensorID on line: %d  and  %d", i, sensorId[streamRes.SensorID])})
+			logRecs = append(logRecs, internal.LogRecord{Err: nil, Msg: fmt.Sprintf("Duplicate SensorID on line: %d  and  %d", i, sensorId[streamRes.SensorID])})
 			continue
 		} else {
 			sensorId[streamRes.SensorID] = i
@@ -81,19 +82,19 @@ func executeCheck(file string) {
 		// SensorID is the primaryKey
 		storedSteam, err = repo.GetStreamByStreamIdAndSiteCode(streamRes.SensorID, streamRes.SiteCode)
 		if err != nil {
-			logRecs = append(logRecs, logRecord{err: err, msg: "Failed to get stream"})
+			logRecs = append(logRecs, internal.LogRecord{Err: err, Msg: "Failed to get stream"})
 			continue
 		}
 		if len(storedSteam) == 1 {
 			if !stream.CompareStreams(storedSteam[0], *streamRes) {
-				logRecs = append(logRecs, logRecord{err: nil, msg: fmt.Sprintf("Registry stream: %s need to be updated by file: %s row line: %d ", storedSteam[0].SensorID, file, i)})
+				logRecs = append(logRecs, internal.LogRecord{Err: nil, Msg: fmt.Sprintf("Registry stream: %s need to be updated by file: %s row line: %d ", storedSteam[0].SensorID, file, i)})
 			}
 
 		}
 		if len(storedSteam) > 1 {
-			logRecs = append(logRecs, logRecord{err: err, msg: fmt.Sprintf("stream %s at line: %d  in file: %s appears more than once in the Registry", streamRes.SensorID, i, file)})
+			logRecs = append(logRecs, internal.LogRecord{Err: err, Msg: fmt.Sprintf("stream %s at line: %d  in file: %s appears more than once in the Registry", streamRes.SensorID, i, file)})
 		}
 	}
 	fmt.Println("")
-	printLogRecord(logRecs)
+	internal.PrintLogRecord(logRecs)
 }

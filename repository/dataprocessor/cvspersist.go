@@ -44,6 +44,7 @@ func (p CSVPersist) Persist(items []model.Item) error {
 	var rowError bool
 	rowError = false
 	for _, item := range items {
+		removeStandardTags(&item)
 		row := itemToString(item)
 		if err := writer.Write(row); err != nil {
 			log.Logger.Err(err).Msgf("failed to write row: %s", row)
@@ -54,6 +55,38 @@ func (p CSVPersist) Persist(items []model.Item) error {
 		return NewCSVReaderError("failed to write rows", nil)
 	}
 	return nil
+}
+
+func removeStandardTags(item *model.Item) {
+	listOfTagToRemove := []int{}
+	for i, tag := range item.Tags {
+		if isTagInExpectedHeaders(tag.Name) {
+			listOfTagToRemove = append(listOfTagToRemove, i)
+		}
+	}
+	for j, i := range listOfTagToRemove {
+		item.Tags = append(item.Tags[:i-j], item.Tags[i-j+1:]...)
+	}
+}
+
+// [a, b, c, d, e, g, h]
+//
+//	0  1  2  3  4  5  6
+//
+// 2 4 6
+// remove index 2
+// [a, b, d, e, g, h]
+// remove index 4 now is index 3 (4 - 1 removed)
+// [a, b, d, g, h]
+// remove index 6 nos is index 4 (6 - 2 removed)
+// [a, b, d, g]
+func isTagInExpectedHeaders(tag string) bool {
+	for _, header := range expectedHeaders {
+		if header == tag {
+			return true
+		}
+	}
+	return false
 }
 
 func itemToString(item model.Item) []string {

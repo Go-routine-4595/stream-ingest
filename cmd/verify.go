@@ -2,13 +2,14 @@ package cmd
 
 import (
 	"fmt"
-	"github.com/schollz/progressbar/v3"
 	"io"
 
 	"githb.com/Go-routine-4595/stream-ingest/domain/stream"
+	"githb.com/Go-routine-4595/stream-ingest/internal"
 	"githb.com/Go-routine-4595/stream-ingest/repository/dataprocessor"
 
 	"github.com/rs/zerolog/log"
+	"github.com/schollz/progressbar/v3"
 	"github.com/spf13/cobra"
 )
 
@@ -38,7 +39,7 @@ func executeVerify(file string) {
 		issue      bool
 		lineNumber int
 		bar        *progressbar.ProgressBar
-		logRecs    []logRecord
+		logRecs    []internal.LogRecord
 		sensorId   map[string]int
 	)
 
@@ -66,13 +67,13 @@ func executeVerify(file string) {
 			if err == io.EOF {
 				break
 			}
-			logRecs = append(logRecs, logRecord{err: err, msg: fmt.Sprintf("Failed to read next stream on line: %d", i)})
+			logRecs = append(logRecs, internal.LogRecord{Err: err, Msg: fmt.Sprintf("Failed to read next stream on line: %d", i)})
 			issue = true
 		}
 		// check is a row had the same sensorId we already processed in the file
 		// SensorID is the primaryKey
 		if _, ok := sensorId[streamRes.SensorID]; ok {
-			logRecs = append(logRecs, logRecord{err: nil, msg: fmt.Sprintf("Duplicate SensorID on line: %d  and  %d", i, sensorId[streamRes.SensorID])})
+			logRecs = append(logRecs, internal.LogRecord{Err: nil, Msg: fmt.Sprintf("Duplicate SensorID on line: %d  and  %d", i, sensorId[streamRes.SensorID])})
 		} else {
 			sensorId[streamRes.SensorID] = i
 		}
@@ -82,6 +83,6 @@ func executeVerify(file string) {
 		log.Logger.Info().Msg("Syntax is valid")
 	}
 	if len(logRecs) > 0 {
-		printLogRecord(logRecs)
+		internal.PrintLogRecord(logRecs)
 	}
 }

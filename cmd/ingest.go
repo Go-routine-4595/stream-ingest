@@ -2,12 +2,13 @@ package cmd
 
 import (
 	"fmt"
-	"githb.com/Go-routine-4595/stream-ingest/model"
 	"io"
 	"os"
 	"time"
 
 	"githb.com/Go-routine-4595/stream-ingest/domain/stream"
+	"githb.com/Go-routine-4595/stream-ingest/internal"
+	"githb.com/Go-routine-4595/stream-ingest/model"
 	"githb.com/Go-routine-4595/stream-ingest/repository/cosmos"
 	"githb.com/Go-routine-4595/stream-ingest/repository/dataprocessor"
 
@@ -56,21 +57,19 @@ func executeIngest(file string, update bool, user string) {
 		newStream          *stream.Stream
 		fetchedStreams     []stream.Stream
 		unprocessedStreams []stream.Stream
-		streamsToCreate    []stream.Stream
-		streamsToUpdate    []stream.Stream
 		reader             *dataprocessor.CSVReader
-		repo               cosmos.Repository
+		repo               *cosmos.Repository
 		persite            dataprocessor.CSVPersist
 		lineNumber         int
 		bar                *progressbar.ProgressBar
-		LogRecords         []logRecord
+		LogRecords         []internal.LogRecord
 		sensorId           map[string]int
 		resFile            string
 	)
 
 	reader, err = dataprocessor.NewCSVReader(file, user)
 	if err != nil {
-		log.Logger.Err(err)
+		log.Logger.Err(err).Msg("failed to create reader")
 		return
 	}
 
@@ -87,8 +86,6 @@ func executeIngest(file string, update bool, user string) {
 	repo = cosmos.NewRespository()
 
 	unprocessedStreams = make([]stream.Stream, 0)
-	streamsToCreate = make([]stream.Stream, 0)
-	streamsToUpdate = make([]stream.Stream, 0)
 	sensorId = make(map[string]int)
 
 	lineNumber, err = reader.CountLines()
@@ -105,13 +102,13 @@ func executeIngest(file string, update bool, user string) {
 			if err == io.EOF {
 				break
 			}
-			LogRecords = append(LogRecords, logRecord{err: err, msg: fmt.Sprintf("Failed to read next stream line: %d", i)})
+			LogRecords = append(LogRecords, internal.LogRecord{Err: err, Msg: fmt.Sprintf("Failed to read next stream line: %d", i)})
 			return
 		}
 		// check is a row had the same sensorId we already processed in the file
 		// SensorID is the primaryKey
 		if _, ok := sensorId[newStream.SensorID]; ok {
-			LogRecords = append(LogRecords, logRecord{err: nil, msg: fmt.Sprintf("Duplicate SensorID on line: %d  and  %d", i, sensorId[newStream.SensorID])})
+			LogRecords = append(LogRecords, internal.LogRecord{Err: nil, Msg: fmt.Sprintf("Duplicate SensorID on line: %d  and  %d", i, sensorId[newStream.SensorID])})
 			continue
 		} else {
 			sensorId[newStream.SensorID] = i
@@ -119,13 +116,13 @@ func executeIngest(file string, update bool, user string) {
 		// fetchStreams in DB for the stream we just created, is the stream already existing?
 		fetchedStreams, err = repo.GetStreamByStreamIdAndSiteCode(newStream.SensorID, newStream.SiteCode)
 		if err != nil {
-			LogRecords = append(LogRecords, logRecord{err: err, msg: "Failed to get stream"})
+			LogRecords = append(LogRecords, internal.LogRecord{Err: err, Msg: "Failed to get stream"})
 			unprocessedStreams = append(unprocessedStreams, *newStream)
 			continue
 		}
 		// we found multiple steram with the same SensorID this should not append...
 		if len(fetchedStreams) > 1 {
-			LogRecords = append(LogRecords, logRecord{err: err, msg: fmt.Sprintf("More than one stream found in the Registry for %s at line %d in file %s", newStream.SensorID, i, file)})
+			LogRecords = append(LogRecords, internal.LogRecord{Err: err, Msg: fmt.Sprintf("More than one stream found in the Registry for %s at line %d in file %s", newStream.SensorID, i, file)})
 			unprocessedStreams = append(unprocessedStreams, *newStream)
 			continue
 		}
@@ -133,31 +130,27 @@ func executeIngest(file string, update bool, user string) {
 		// if the stream exists we might need to update it
 		if len(fetchedStreams) == 1 {
 			if !stream.CompareStreams(fetchedStreams[0], *newStream) {
-				LogRecords = append(LogRecords, logRecord{err: nil, msg: fmt.Sprintf("Registry streamId: %s need to be updated by file: %s row line: %d ", fetchedStreams[0].SensorID, file, i)})
+				LogRecords = append(LogRecords, internal.LogRecord{Err: nil, Msg: fmt.Sprintf("Registry streamId: %s need to be updated by file: %s row line: %d ", fetchedStreams[0].SensorID, file, i)})
 				updateStream(update, &fetchedStreams[0], newStream, user)
-				streamsToUpdate = append(streamsToUpdate, fetchedStreams[0])
+				unprocessedItems, logErr := repo.UpdateBatchedStreamsByStreamKey(fetchedStreams[0])
+				unprocessedStreams = append(unprocessedStreams, unprocessedItems...)
+				LogRecords = append(LogRecords, logErr...)
 			}
 			continue
 		}
 		// no stream exist simple we create it
 		if len(fetchedStreams) == 0 {
-			streamsToCreate = append(streamsToCreate, *newStream)
+			unprocessedItems, logErr := repo.CreatBatchedStreamsByStreamKey(*newStream)
+			unprocessedStreams = append(unprocessedStreams, unprocessedItems...)
+			LogRecords = append(LogRecords, logErr...)
 		}
 	}
-	// Now we add our stream in the DB
-	if len(streamsToCreate) > 0 {
-		errs := repo.CreatStreamsByStreamKey(streamsToCreate)
-		if len(errs) > 0 {
-			addError(&LogRecords, errs, "failed to create stream")
-		}
-	}
-	// Now we update stream in the DB
-	if len(streamsToUpdate) > 0 {
-		errs := repo.UpdateStreamsByStreamKey(streamsToUpdate)
-		if len(errs) > 0 {
-			addError(&LogRecords, errs, "failed to create stream")
-		}
-	}
+
+	// Empty all Repo batches
+	unprocessedItems, logErr := repo.Close()
+	unprocessedStreams = append(unprocessedStreams, unprocessedItems...)
+	LogRecords = append(LogRecords, logErr...)
+
 	// if we have unpocessed stream we need to let know the user
 	// with a new CSV file
 	if len(unprocessedStreams) > 0 {
@@ -165,7 +158,7 @@ func executeIngest(file string, update bool, user string) {
 	} else {
 		_ = deleteFile(resFile)
 	}
-	printLogRecord(LogRecords)
+	internal.PrintLogRecord(LogRecords)
 }
 
 func updateStream(update bool, stream1 *stream.Stream, stream2 *stream.Stream, user string) {
@@ -176,7 +169,7 @@ func updateStream(update bool, stream1 *stream.Stream, stream2 *stream.Stream, u
 	}
 }
 
-func processUnProcessed(p dataprocessor.CSVPersist, unprocessed []stream.Stream, records *[]logRecord) {
+func processUnProcessed(p dataprocessor.CSVPersist, unprocessed []stream.Stream, records *[]internal.LogRecord) {
 	var items []model.Item
 
 	items = make([]model.Item, len(unprocessed))
@@ -184,10 +177,11 @@ func processUnProcessed(p dataprocessor.CSVPersist, unprocessed []stream.Stream,
 	for i, streamS := range unprocessed {
 		item := streamS.ConvertStreamToItem()
 		items[i] = item
+
 	}
 	err := p.Persist(items)
 	if err != nil {
-		*records = append(*records, logRecord{err: err, msg: "Failed to persist"})
+		*records = append(*records, internal.LogRecord{Err: err, Msg: "Failed to persist"})
 	}
 
 }

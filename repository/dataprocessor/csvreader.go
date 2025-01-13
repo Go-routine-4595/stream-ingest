@@ -110,7 +110,7 @@ func (r *CSVReader) ReadNext() (*stream.Stream, error) {
 	}
 
 	// Convert the row into a Item struct
-	item, err := parseRowToItem(expectedHeaders, row)
+	item, err := parseRowToItem(r.headers, row)
 	if err != nil {
 		return nil, NewCSVReaderError("failed to parse row into Item: %w", err)
 	}
@@ -160,6 +160,7 @@ func (r *CSVReader) CountLines() (int, error) {
 
 // parseRowToItem converts a row (slice of strings) into a Stream struct.
 func parseRowToItem(headers []string, row []string) (*model.Item, error) {
+
 	// Ensure the length of row matches or exceeds the headers
 	if len(row) < len(headers) {
 		return nil, fmt.Errorf("row does not contain enough columns")
@@ -172,10 +173,9 @@ func parseRowToItem(headers []string, row []string) (*model.Item, error) {
 	var tags []model.Tag
 
 	// Map each known header to the corresponding field in the Item
+	//for i, header := range headers {
 	for i, header := range headers {
-		if i >= len(row) {
-			break
-		}
+
 		ltag := model.Tag{}
 		switch header {
 		case "SiteCode":
@@ -284,7 +284,10 @@ func parseItemToStream(item *model.Item, user string) (*stream.Stream, error) {
 	streamRes.UOM = item.UOM
 	streamRes.Tags = make([]interface{}, len(item.Tags))
 	for i, tag := range item.Tags {
-		streamRes.Tags[i] = tag
+		streamRes.Tags[i] = map[string]interface{}{
+			"name":  tag.Name,
+			"value": tag.Value,
+		}
 	}
 
 	streamRes.MinValue, err = strconv.Atoi(item.MinValue)
