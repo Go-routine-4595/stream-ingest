@@ -1,15 +1,36 @@
+// Package cmd
+// -----------------------------------------------------------------------------
+// File: check.go
+// Description: This file implements the CLI command(s) for ingesting stream
+//
+//				into FCTS.
+//
+//	            It provides functionalities to interact with the user and
+//	            verify the input streams definition file syntax and check if
+//				the streams already exist in the CosmosDB
+//
+// Author: <Christophe Buffard>
+// Created: <01/15/2025>
+// -----------------------------------------------------------------------------
+// Notes:
+//   - This file is part of the FCTS/stream ingestion project.
+//   - Updated/reliable documentation and usage examples can be found at:
+//     <Link to project README or documentation>
+//
+// -----------------------------------------------------------------------------
 package cmd
 
 import (
+	"errors"
+	"fmi/stream-ingest/model"
 	"fmt"
-	"githb.com/Go-routine-4595/stream-ingest/repository/cosmos"
-	"github.com/schollz/progressbar/v3"
+	"github.com/rs/zerolog/log"
 	"io"
 
-	"githb.com/Go-routine-4595/stream-ingest/domain/stream"
-	"githb.com/Go-routine-4595/stream-ingest/repository/dataprocessor"
+	"fmi/stream-ingest/internal"
+	"fmi/stream-ingest/repository/cosmos"
+	"fmi/stream-ingest/repository/dataprocessor"
 
-	"github.com/rs/zerolog/log"
 	"github.com/spf13/cobra"
 )
 
@@ -20,80 +41,141 @@ var checkCmd = &cobra.Command{
 	Args:  cobra.ExactArgs(1), // Expect exactly one argument (file)
 	Run: func(cmd *cobra.Command, args []string) {
 		file := args[0]
-		fmt.Printf("Checking if data in file %s exists in the database\n", file)
+		debug, _ := cmd.Flags().GetBool("debug")
+		verb, _ := cmd.Flags().GetBool("verbose")
+		prod, _ := cmd.Flags().GetBool("prod")
+		var instance string
+		if prod {
+			instance = "Prod"
+		} else {
+			instance = "Dev"
+		}
+		fmt.Printf("Checking if data in file %s exists in the database %s \n", file, instance)
 		// Call your logic to check the file contents against the database here
-		executeCheck(file)
+		executeCheck(file, debug, instance, verb)
 	},
 }
 
 func init() {
+	checkCmd.Flags().BoolP("debug", "d", false, "debug mode, will save all UUID (id) in the log file.")
+	checkCmd.Flags().BoolP("prod", "p", false, "Production CosmosDB used.")
+	checkCmd.Flags().BoolP("verbose", "v", false, "verbose mode, will print all log messages.")
+
 	rootCmd.AddCommand(checkCmd)
 }
 
-func executeCheck(file string) {
+func executeCheck(file string, debug bool, instance string, verb bool) {
 	var (
-		err         error
-		streamRes   *stream.Stream
-		storedSteam []stream.Stream
-		reader      *dataprocessor.CSVReader
-		repo        cosmos.Repository
-		lineNumber  int
-		bar         *progressbar.ProgressBar
-		logRecs     []logRecord
-		sensorId    map[string]int
+		err                error
+		logRecs            []internal.LogRecord
+		recordsToBeUpdated int
+		recordsToBeCreated int
 	)
 
-	reader, err = dataprocessor.NewCSVReader(file, "")
+	regEle, err := model.NewRegistry(file)
 	if err != nil {
-		fmt.Println(err)
+		fmt.Printf("unregonize csv header: %v \n", err)
 		return
+	}
+
+	reader, err := dataprocessor.NewCSVReader(file, "", regEle.GetHeaders())
+	if err != nil {
+		if errors.Is(err, dataprocessor.UnknownTagErr) {
+			fmt.Println(err)
+		} else {
+			fmt.Println(err)
+			return
+		}
 	}
 
 	defer reader.Close()
 
-	repo = cosmos.NewRespository()
-	sensorId = make(map[string]int)
+	repo := cosmos.NewRepository(instance)
+	sensorId := make(map[string]int)
 
-	lineNumber, err = reader.CountLines()
-	bar = progressBar(lineNumber, "Writing processing file "+file+"...")
+	lineNumber, err := reader.CountLines()
+	bar, bucket, remainder := progressBar(lineNumber, "Processing file "+file)
 	defer bar.Finish()
 
+	//fmt.Printf("bucket size: %d \n", bucket)
+
 	// We skip the first line (header)
-	_, _ = reader.ReadNext()
+	err = reader.SkipLine()
+	if err != nil {
+		logRecs = append(logRecs, internal.LogRecord{Err: err, Msg: "Failed to skip header line"})
+		return
+	}
+
 	for i := 2; ; i++ {
-		bar.Add(1)
-		streamRes, err = reader.ReadNext()
+		if i%bucket == 0 {
+			_ = bar.Add(bucket)
+		}
+		streamRes := regEle.NewElement("")
+		err = reader.ReadNext(streamRes)
 		if err != nil {
 			if err == io.EOF {
 				break
 			}
-			log.Logger.Err(err).Msg("Failed to read next stream")
-			logRecs = append(logRecs, logRecord{err: err, msg: fmt.Sprintf("Failed to read next stream on line: %d", i)})
+			logRecs = append(logRecs, internal.LogRecord{Err: err, Msg: fmt.Sprintf("Failed to read next stream on line: %d", i)})
+			internal.PrintLogRecord(logRecs)
+			return
 		}
 		// check is a row had the same sensorId we already processed in the file
 		// SensorID is the primaryKey
-		if _, ok := sensorId[streamRes.SensorID]; ok {
-			logRecs = append(logRecs, logRecord{err: nil, msg: fmt.Sprintf("Duplicate SensorID on line: %d  and  %d", i, sensorId[streamRes.SensorID])})
+		if _, ok := sensorId[streamRes.GetID()]; ok {
+			logRecs = append(logRecs, internal.LogRecord{Err: nil, Msg: fmt.Sprintf("Duplicate SensorID on line: %d  and  %d", i, sensorId[streamRes.GetID()])})
+			//internal.PrintLogRecord(logRecs)
 			continue
 		} else {
-			sensorId[streamRes.SensorID] = i
+			sensorId[streamRes.GetID()] = i
 		}
 		// SensorID is the primaryKey
-		storedSteam, err = repo.GetStreamByStreamIdAndSiteCode(streamRes.SensorID, streamRes.SiteCode)
+		//storedSteams, err := repo.GetStreamByStreamIdAndSiteCode(streamRes.GetID(), streamRes.GetSiteCode())
+		storeStreams, err := regEle.GetElementFromRepo(repo, streamRes.GetID(), streamRes.GetSiteCode())
 		if err != nil {
-			logRecs = append(logRecs, logRecord{err: err, msg: "Failed to get stream"})
+			logRecs = append(logRecs, internal.LogRecord{Err: err, Msg: "Failed to get stream"})
+			internal.PrintLogRecord(logRecs)
+			return
+		}
+		if len(storeStreams) == 0 {
+			logRecs = append(logRecs, internal.LogRecord{Err: nil, Msg: fmt.Sprintf("stream \"%s\" at line: %d  in file: %s does not exist in the Registry", streamRes.GetID(), i, file)})
+			recordsToBeCreated++
 			continue
 		}
-		if len(storedSteam) == 1 {
-			if !stream.CompareStreams(storedSteam[0], *streamRes) {
-				logRecs = append(logRecs, logRecord{err: nil, msg: fmt.Sprintf("Registry stream: %s need to be updated by file: %s row line: %d ", storedSteam[0].SensorID, file, i)})
+		if len(storeStreams) == 1 {
+			err = storeStreams[0].Validate()
+			if err != nil {
+				logRecs = append(logRecs, internal.LogRecord{Err: err, Msg: fmt.Sprintf("Registry stream:\"%s\" in ComsosDB has duplicated tag", storeStreams[0].GetID())})
+				internal.PrintLogRecord(logRecs)
+				return
+			}
+			//stream.CompareStreams(storedSteams[0], streamRes)
+			if !storeStreams[0].CompareTo(streamRes) {
+				logRecs = append(logRecs, internal.LogRecord{Err: nil, Msg: fmt.Sprintf("Registry stream:\"%s\" need to be updated by file: %s row line: %d ", storeStreams[0].GetID(), file, i)})
+				recordsToBeUpdated++
 			}
 
 		}
-		if len(storedSteam) > 1 {
-			logRecs = append(logRecs, logRecord{err: err, msg: fmt.Sprintf("stream %s at line: %d  in file: %s appears more than once in the Registry", streamRes.SensorID, i, file)})
+		if len(storeStreams) > 1 {
+			logRecs = append(logRecs, internal.LogRecord{Err: err, Msg: fmt.Sprintf("stream \"%s\" at line: %d  in file: %s appears more than once in the Registry", streamRes.GetID(), i, file)})
+			if debug {
+				for _, fetchedStream := range storeStreams {
+					logRecs = append(logRecs, internal.LogRecord{Err: errors.New("multiple stream defined"), Msg: fmt.Sprintf("sensorId: \"%s\" stream.ID: \"%s\"", fetchedStream.GetID(), fetchedStream.GetInternalID())})
+				}
+				internal.PrintLogRecord(logRecs)
+				return
+			}
 		}
 	}
+	_ = bar.Add(remainder)
 	fmt.Println("")
-	printLogRecord(logRecs)
+	if verb {
+		internal.PrintLogErrRecord(logRecs)
+	}
+	log.Info().Msgf(
+		"There are %6d streams/constants that need to be updated",
+		recordsToBeUpdated)
+	log.Info().Msgf(
+		"There are %6d streams/constants that need to be created",
+		recordsToBeCreated)
 }

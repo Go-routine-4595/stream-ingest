@@ -1,3 +1,19 @@
+// Package dataprocessor
+// -----------------------------------------------------------------------------
+// File: csverror.go
+// Description: This file implements the CLI command(s) for ingesting stream
+//				CSV error helper
+//
+// Author: <Christophe Buffard>
+// Created: <01/15/2025>
+// -----------------------------------------------------------------------------
+// Notes:
+//   - This file is part of the FCTS/stream ingestion project.
+//   - Updated/reliable documentation and usage examples can be found at:
+//     <Link to project README or documentation>
+//
+// -----------------------------------------------------------------------------
+
 package dataprocessor
 
 import "fmt"

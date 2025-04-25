@@ -1,364 +1,190 @@
+// Package stream
+// -----------------------------------------------------------------------------
+// File: stream.go
+// Description: This file implements the CLI command(s) for ingesting stream
+//
+//				into FCTS.
+//
+//	            stream is the main component, it represents a stream FCTS canonical
+//	            data model in CosmoDB
+//
+// Author: <Christophe Buffard>
+// Created: <01/15/2025>
+// -----------------------------------------------------------------------------
+// Notes:
+//   - This file is part of the FCTS/stream ingestion project.
+//   - Updated/reliable documentation and usage examples can be found at:
+//     <Link to project README or documentation>
+//
+// -----------------------------------------------------------------------------
 package stream
 
 import (
-	"fmt"
-	"githb.com/Go-routine-4595/stream-ingest/model"
-	"github.com/google/uuid"
-	"reflect"
-	"strconv"
-	"strings"
-	"time"
+	"errors"
+	"fmi/stream-ingest/domain/base"
+	"fmi/stream-ingest/domain/definition"
+	"math"
 )
 
-// Tags
-const (
-	EquipmentClass       = "EquipmentClass"
-	EquipmentComponent   = "EquipmentComponent"
-	EquipmentMeasurement = "EquipmentMeasurement"
-	EquipmentName        = "EquipmentName"
-	EquipmentType        = "EquipmentType"
-	Interpolation        = "Interpolation"
-	OpStatsLoader        = "OpStatsLoader"
-	SAPEquipmentID       = "SAPEquipmentID"
-	SAPMeasurementID     = "SAPMeasurementID"
-	SAPMeasurementType   = "SAPMeasurementType"
-	SAPUOM               = "SAPUOM"
-	Scaling              = "Scaling"
-	SIMS                 = "SIMS"
-	UDE                  = "UDE"
-	Workflow             = "Workflow"
-	SiteShortCode        = "SiteShortCode"
-)
-
-// Process
-const (
-	CNCCrushConvey          = "CNC"
-	ENVEnvironmental        = "ENV"
-	GDEEquipmentManagement  = "GDE"
-	FTCFMCTechnologyCenter  = "FTC"
-	FNLFragmentationLoading = "FNL"
-	General                 = "GEN"
-	Haulage                 = "HAU"
-	HM                      = "HM"
-	Leaching                = "LEA"
-	MN                      = "MN"
-	MO                      = "MO"
-	MIS                     = "MIS"
-	REF                     = "REF"
-	ROD                     = "ROD"
-	SMLSmelting             = "SML"
-	TCLWTCLW                = "TCLW"
-	GMX                     = "GMX"
-)
-
-// IsProcess helper function
-func IsProcess(s string) bool {
-	return s == CNCCrushConvey ||
-		s == ENVEnvironmental ||
-		s == GDEEquipmentManagement ||
-		s == FTCFMCTechnologyCenter ||
-		s == FNLFragmentationLoading ||
-		s == General ||
-		s == Haulage ||
-		s == HM ||
-		s == Leaching ||
-		s == MN ||
-		s == MO ||
-		s == MIS ||
-		s == REF ||
-		s == ROD ||
-		s == SMLSmelting ||
-		s == TCLWTCLW ||
-		s == GMX
-
-}
-
-// IsTag helper function
-func IsTag(s string) bool {
-	return s == EquipmentClass ||
-		s == EquipmentComponent ||
-		s == EquipmentMeasurement ||
-		s == EquipmentName ||
-		s == EquipmentType ||
-		s == Interpolation ||
-		s == OpStatsLoader ||
-		s == SAPEquipmentID ||
-		s == SAPMeasurementID ||
-		s == SAPMeasurementType ||
-		s == SAPUOM ||
-		s == Scaling ||
-		s == SIMS ||
-		s == UDE ||
-		s == Workflow ||
-		s == SiteShortCode
+// ExpectedHeaders defines the list of strings representing the expected header names in a data processing context.
+var expectedHeaders = []string{
+	definition.CsvSiteCode,
+	definition.CsvSensorId,
+	definition.CsvStreamName,
+	definition.CsvProcess,
+	definition.CsvScaleFactor,
+	definition.CsvMinValue,
+	definition.CsvMaxValue,
+	definition.CsvLoLo,
+	definition.CsvLo,
+	definition.CsvHi,
+	definition.CsvHiHi,
+	definition.CsvUom,
 }
 
 // Stream represents the structure of the stream item.
 type Stream struct {
-	ID           string        `json:"id"`
-	RegistryType string        `json:"registryType"`
-	Index        int           `json:"index"`
-	SiteCode     string        `json:"siteCode"`
-	Process      string        `json:"process"`
-	StreamName   string        `json:"streamName"`
-	SensorID     string        `json:"sensorId"`
-	UOM          string        `json:"uom"`
-	ScaleFactor  int           `json:"scaleFactor"`
-	Precision    int           `json:"precision"`
-	MinValue     int           `json:"minValue"`
-	MaxValue     int           `json:"maxValue"`
-	LoLo         int           `json:"loLo"`
-	Lo           int           `json:"lo"`
-	Hi           int           `json:"hi"`
-	HiHi         int           `json:"hiHi"`
-	Step         bool          `json:"step"`
-	Tags         []interface{} `json:"tags"` // To be filled later
-	Status       string        `json:"status"`
-	Version      int           `json:"version"`
-	CreatedBy    string        `json:"createdBy"`
-	UpdatedBy    string        `json:"updatedBy"`
-	CreatedUtc   string        `json:"createdUtc"`
-	UpdatedUtc   string        `json:"updatedUtc"`
+	*base.Base
+	RegistryType string  `json:"registryType"`
+	StreamName   string  `json:"streamName"`
+	SensorID     string  `json:"sensorId"`
+	ScaleFactor  float32 `json:"scaleFactor"`
+}
+
+func (s *Stream) GetInternalId() string {
+	return s.Base.GetInternalID()
 }
 
 // NewStream creates and returns a new Stream with default values.
-func NewStream() Stream {
-	return Stream{
-		ID:           uuid.NewString(),
+func NewStream(user string) *Stream {
+	return &Stream{
+		Base:         base.NewBase(user),
 		RegistryType: "stream",
-		Index:        1,
-		SiteCode:     "",
-		Process:      "",
 		StreamName:   "",
 		SensorID:     "",
-		UOM:          "",
-		ScaleFactor:  0,
-		Precision:    0,
-		MinValue:     0,
-		MaxValue:     0,
-		LoLo:         0,
-		Lo:           0,
-		Hi:           0,
-		HiHi:         0,
-		Step:         true,
-		Tags:         []interface{}{}, // To be filled later
-		Status:       "active",
-		Version:      1,
+		ScaleFactor:  float32(math.NaN()),
 	}
 }
 
-// Helper function to format UTC time to ISO 8601 with microsecond precision ending in "Z"
-func formatUtcTimestamp(t time.Time) string {
-	return t.Format("2006-01-02T15:04:05.000000Z")
+// ToRow converts the Stream object into a slice of strings, representing its fields and flattened tags.
+// can be used to store in a CSV file
+func (s *Stream) ToRow() []string {
+	var row []string
+
+	row = append(row, s.SiteCode)
+	row = append(row, s.SensorID)
+	row = append(row, s.StreamName)
+	row = append(row, s.Process)
+	row = append(row, base.ToString(s.ScaleFactor))
+	row = append(row, base.ToString(s.MinValue))
+	row = append(row, base.ToString(s.MaxValue))
+	row = append(row, base.ToString(s.LoLo))
+	row = append(row, base.ToString(s.Lo))
+	row = append(row, base.ToString(s.Hi))
+	row = append(row, base.ToString(s.HiHi))
+	row = append(row, s.UOM)
+	row = append(row, s.ToRowWithTags()...)
+
+	return row
 }
 
-func (s Stream) SetCreationBy(user string) Stream {
-	s.CreatedBy = user
-	s.UpdatedBy = user
-	s.CreatedUtc = formatUtcTimestamp(time.Now())
-	s.UpdatedUtc = formatUtcTimestamp(time.Now())
-	return s
-}
+func (s *Stream) Mapper(header string, value string) error {
+	var err error
 
-func (s Stream) SetUpdateBy(user string) Stream {
-	s.UpdatedBy = user
-	s.UpdatedUtc = formatUtcTimestamp(time.Now())
-	return s
-}
-
-// UpdateTags updates the Tags field by adding new tags that are not already present
-func UpdateTags(stream1 *Stream, stream2 *Stream, user string) {
-	existingTagsSet := make(map[model.Tag]bool)
-
-	// Add existing tags to the set for quick lookup
-	for _, tag := range stream1.Tags {
-		var t model.Tag
-		t.Value = tag.(map[string]interface{})["value"].(string)
-		t.Name = tag.(map[string]interface{})["name"].(string)
-		existingTagsSet[t] = true
-	}
-
-	// Add only the new tags that are not already in the set
-	for _, tag := range stream2.Tags {
-		if _, exists := existingTagsSet[tag.(model.Tag)]; !exists {
-			var interfaceValue interface{} = tag
-			stream1.Tags = append(stream1.Tags, interfaceValue)
+	switch header {
+	case definition.CsvSensorId:
+		s.SensorID = value
+		return nil
+	case definition.CsvStreamName:
+		s.StreamName = value
+		return nil
+	case definition.CsvScaleFactor:
+		s.ScaleFactor, err = base.GetFloatValueFrom(value)
+		if err != nil {
+			return errors.Join(errors.New(definition.ErrBaseInvalidScaleFactor), err)
 		}
+		return nil
 	}
-	*stream1 = stream1.SetUpdateBy(user)
-
+	return s.Base.Mapper(header, value)
 }
 
-// UpdateStreamOld updates the fields of stream1 with the fields of stream2.
-// Only non-zero or non-default values from stream2 will overwrite those in stream1.
-func UpdateStreamOld(stream1 *Stream, stream2 *Stream, user string) {
-	v1 := reflect.ValueOf(stream1).Elem()
-	v2 := reflect.ValueOf(stream2).Elem()
+// GetID retrieves the unique identifier of the Stream instance. Returns the ID as a string.
+func (s *Stream) GetID() string {
+	return s.SensorID
+}
 
-	for i := 0; i < v1.NumField(); i++ {
-		field1 := v1.Field(i)
-		field2 := v2.Field(i)
+// GetSiteCode retrieves the SiteCode property of the Stream instance as a string.
+// implement the cosmos.Batcher interface
+func (s *Stream) GetSiteCode() string {
+	return s.SiteCode
+}
 
-		if field2.IsValid() && field2.Interface() != reflect.Zero(field2.Type()).Interface() {
-			// Skip updating the CreatedUtc and CreatedBy field if required to preserve its originality
-			if name := v1.Type().Field(i).Name; name == "CreatedUtc" {
-				continue
-			}
-			if name := v1.Type().Field(i).Name; name == "CreatedBy" {
-				continue
-			}
-			if name := v1.Type().Field(i).Name; name == "UpdatedUtc" {
-				field1.Set(reflect.ValueOf(formatUtcTimestamp(time.Now())))
-				continue
-			}
-			if name := v1.Type().Field(i).Name; name == "UpdateBy" {
-				field1.Set(reflect.ValueOf(user))
-				continue
-			}
-			if name := v1.Type().Field(i).Name; name == "ID" {
-				continue
-			}
-			field1.Set(field2)
-		}
+// ProcessNumericalValue checks if the ScaleFactor is NaN and resets it to 1 if true, then processes numeric values via Base.
+func (s *Stream) ProcessNumericalValue() {
+	if math.IsNaN(float64(s.ScaleFactor)) {
+		s.ScaleFactor = 1
 	}
+	s.Base.ProcessNumericalValue()
 }
 
-// UpdateStream updates the fields of stream1 with the fields of stream2.
-// and UpdateTag set the modify by/and date
-func UpdateStream(s1 *Stream, s2 *Stream, user string) {
-	s1.Process = s2.Process
-	s1.StreamName = s2.StreamName
-	s1.UOM = s2.UOM
-	s1.ScaleFactor = s2.ScaleFactor
-	s1.Precision = s2.Precision
-	s1.MinValue = s2.MinValue
-	s1.MaxValue = s2.MaxValue
-	s1.LoLo = s2.LoLo
-	s1.Lo = s2.Lo
-	s1.Hi = s2.Hi
-	s1.HiHi = s2.HiHi
-	UpdateTags(s1, s2, user)
-}
-
-// CompareStreams compares two Stream objects and returns true if they are identical, otherwise false.
-func CompareStreams(s1 Stream, s2 Stream) bool {
-	// Compare field by field
-	return s1.ID == s2.ID &&
-		s1.RegistryType == s2.RegistryType &&
-		s1.Index == s2.Index &&
-		s1.SiteCode == s2.SiteCode &&
-		s1.Process == s2.Process &&
-		s1.StreamName == s2.StreamName &&
-		s1.SensorID == s2.SensorID &&
-		s1.UOM == s2.UOM &&
-		s1.ScaleFactor == s2.ScaleFactor &&
-		s1.Precision == s2.Precision &&
-		s1.MinValue == s2.MinValue &&
-		s1.MaxValue == s2.MaxValue &&
-		s1.LoLo == s2.LoLo &&
-		s1.Lo == s2.Lo &&
-		s1.Hi == s2.Hi &&
-		s1.HiHi == s2.HiHi &&
-		compareTags(s1.Tags, s2.Tags)
-}
-
-// compareTags is a helper function to compare two slices of interface{} representing tags.
-func compareTags(tags1 []interface{}, tags2 []interface{}) bool {
-	if len(tags1) != len(tags2) {
+// CompareTo compares two Stream objects and returns true if they are identical, otherwise false.
+func (s *Stream) CompareTo(other any) bool {
+	// CompareTo field by field
+	// excluding index
+	s2, ok := other.(*Stream)
+	if !ok {
 		return false
 	}
-
-	// Convert tags slices to maps for easy comparison
-	tagMap1 := make(map[model.Tag]bool)
-	tagMap2 := make(map[model.Tag]bool)
-
-	for _, tag := range tags1 {
-		if t, ok := tag.(model.Tag); ok {
-			tagMap1[t] = true
-		}
-	}
-
-	for _, tag := range tags2 {
-		if t, ok := tag.(model.Tag); ok {
-			tagMap2[t] = true
-		}
-	}
-
-	// Compare tag maps
-	if len(tagMap1) != len(tagMap2) {
-		return false
-	}
-
-	for tag := range tagMap1 {
-		if !tagMap2[tag] {
-			return false
-		}
-	}
-
-	return true
+	return s.Base.CompareTo(*s2.Base) &&
+		s.SensorID == s2.SensorID &&
+		s.StreamName == s2.StreamName &&
+		s.ScaleFactor == s2.ScaleFactor
 }
 
-// ConvertStreamToItem converts a Stream structure to an Item structure.
-func (s Stream) ConvertStreamToItem() model.Item {
-	// Convert Tags from []interface{} to []Tag
-	var tags []model.Tag
-	for _, t := range s.Tags {
-		//if tag, ok := t.(map[string]interface{}); ok {
-		//	for key, value := range tag {
-		//		tags = append(tags, model.Tag{Name: key, Value: toString(value)})
-		//	}
-		//}
-		tag := t.(model.Tag)
-		tags = append(tags, model.Tag{Name: tag.Name, Value: tag.Value})
+// UpdateWith updates the fields of constant1 with the fields of constant2.
+// and UpdateTag set the modifying by/and date
+func (s *Stream) UpdateWith(T any, user string) {
+	s2, ok := T.(*Stream)
+	if !ok {
+		return
 	}
-
-	// Return the converted Item
-	return model.Item{
-		SiteCode:      s.SiteCode,
-		SensorID:      s.SensorID,
-		Name:          s.StreamName,
-		Process:       s.Process,
-		MinValue:      strconv.Itoa(s.MinValue),
-		MaxValue:      strconv.Itoa(s.MaxValue),
-		UOM:           s.UOM,
-		SiteShortCode: getValueForKey(s.Tags, SiteShortCode),
-		//System:               mapSystemFromRegistryType(s.RegistryType),
-		EquipmentUnit:        getValueForKey(s.Tags, EquipmentType), //TODO check this one
-		Subunit:              getValueForKey(s.Tags, "Subunit"),
-		EquipmentComponent:   getValueForKey(s.Tags, EquipmentComponent),
-		EquipmentMeasurement: getValueForKey(s.Tags, EquipmentMeasurement),
-		UDE:                  getValueForKey(s.Tags, UDE),
-		SAPEquipmentID:       getValueForKey(s.Tags, SAPEquipmentID),
-		Tags:                 tags,
-	}
+	s.Base.UpdateWith(*s2.Base, user)
+	s.SensorID = base.CopyString(s.SensorID, s2.SensorID)
+	s.StreamName = base.CopyString(s.StreamName, s2.StreamName)
+	s.ScaleFactor = base.CopyNumValue(s.ScaleFactor, s2.ScaleFactor)
+	s.SetUpdateBy(user)
 }
 
-// Helper function to safely convert an interface{} to a string.
-func toString(value interface{}) string {
-	if value == nil {
-		return ""
-	}
-	return fmt.Sprintf("%v", value)
+func (s *Stream) Delete(user string) {
+	s.SetUpdateBy(user)
+	s.Status = "deleted"
 }
 
-func getValueForKey(tags []interface{}, key string) string {
-	var res []string
-	for _, t := range tags {
-		if tag, ok := t.(model.Tag); ok {
-			if tag.Name == key {
-				res = append(res, tag.Value)
-			}
-		}
-	}
-	return strings.Join(res, ",")
+func (s *Stream) GetRegistryType() string {
+	return s.RegistryType
 }
 
-// getStringFormTags converts a list of tags represented as []interface{} into a single comma-separated string.
-func getStringFormTags(data []interface{}) string {
-	var res []string
+func (s *Stream) GetStatus() string {
+	return s.Status
+}
 
-	for _, tag := range data {
-		res = append(res, tag.(model.Tag).Value)
+// DeepCopy creates a deep copy of the Stream structure.
+// It returns a new Stream instance with all fields copied.
+func (s *Stream) DeepCopy() *Stream {
+	if s == nil {
+		return nil
 	}
-	return strings.Join(res, ",")
+
+	// Create a new Stream
+	copied := &Stream{
+		// Deep copy the Base pointer (assuming base.Base has a DeepCopy method)
+		// If it doesn't, we'll need to manually copy each field from the base
+		Base:         s.Base.DeepCopy(),
+		RegistryType: s.RegistryType,
+		StreamName:   s.StreamName,
+		SensorID:     s.SensorID,
+		ScaleFactor:  s.ScaleFactor,
+	}
+
+	return copied
 }
