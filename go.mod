@@ -1,4 +1,4 @@
-module githb.com/Go-routine-4595/stream-ingest
+module fmi/stream-ingest
 
 go 1.23.4
 

@@ -1,12 +1,32 @@
+// Package cmd
+// -----------------------------------------------------------------------------
+// File: verify.go
+// Description: This file implements the CLI command(s) for ingesting stream
+//
+//				into FCTS.
+//
+//	            It provides functionalities to interact with the user and
+//	            verify the input streams definition file syntax
+//
+// Author: <Christophe Buffard>
+// Created: <01/15/2025>
+// -----------------------------------------------------------------------------
+// Notes:
+//   - This file is part of the FCTS/stream ingestion project.
+//   - Updated/reliable documentation and usage examples can be found at:
+//     <Link to project README or documentation>
+//
+// -----------------------------------------------------------------------------
 package cmd
 
 import (
+	"errors"
+	"fmi/stream-ingest/model"
 	"fmt"
-	"github.com/schollz/progressbar/v3"
 	"io"
 
-	"githb.com/Go-routine-4595/stream-ingest/domain/stream"
-	"githb.com/Go-routine-4595/stream-ingest/repository/dataprocessor"
+	"fmi/stream-ingest/internal"
+	"fmi/stream-ingest/repository/dataprocessor"
 
 	"github.com/rs/zerolog/log"
 	"github.com/spf13/cobra"
@@ -32,56 +52,73 @@ func init() {
 
 func executeVerify(file string) {
 	var (
-		err        error
-		streamRes  *stream.Stream
-		reader     *dataprocessor.CSVReader
-		issue      bool
-		lineNumber int
-		bar        *progressbar.ProgressBar
-		logRecs    []logRecord
-		sensorId   map[string]int
+		err     error
+		logRecs []internal.LogRecord
 	)
 
-	issue = false
-	reader, err = dataprocessor.NewCSVReader(file, "")
+	issue := false
+
+	regEle, err := model.NewRegistry(file)
 	if err != nil {
-		fmt.Println(err)
+		fmt.Printf("unregonize csv header: %v \n", err)
 		return
 	}
 
-	sensorId = make(map[string]int)
+	reader, err := dataprocessor.NewCSVReader(file, "", regEle.GetHeaders())
+	if err != nil {
+		if errors.Is(err, dataprocessor.UnknownTagErr) {
+			fmt.Println(err)
+		} else {
+			fmt.Println(err)
+			return
+		}
+	}
+
+	sensorId := make(map[string]int)
 
 	defer reader.Close()
 
-	lineNumber, err = reader.CountLines()
-	bar = progressBar(lineNumber, "Processing file "+file+"...")
+	lineNumber, err := reader.CountLines()
+	bar, bucket, remainder := progressBar(lineNumber, "Processing file "+file)
 	defer bar.Finish()
 
-	//we skip the first line (header)
-	_, _ = reader.ReadNext()
+	// We skip the first line (header)
+	err = reader.SkipLine()
+	if err != nil {
+		logRecs = append(logRecs, internal.LogRecord{Err: err, Msg: "Failed to skip header line"})
+		return
+	}
+
 	for i := 2; ; i++ {
-		bar.Add(1)
-		streamRes, err = reader.ReadNext()
+		if i%bucket == 0 {
+			_ = bar.Add(bucket)
+		}
+		streamRes := regEle.NewElement("")
+		err = reader.ReadNext(streamRes)
 		if err != nil {
 			if err == io.EOF {
 				break
 			}
-			logRecs = append(logRecs, logRecord{err: err, msg: fmt.Sprintf("Failed to read next stream on line: %d", i)})
+			logRecs = append(logRecs, internal.LogRecord{Err: err, Msg: fmt.Sprintf("Failed to read next stream on line: %d", i)})
 			issue = true
+			continue
 		}
 		// check is a row had the same sensorId we already processed in the file
 		// SensorID is the primaryKey
-		if _, ok := sensorId[streamRes.SensorID]; ok {
-			logRecs = append(logRecs, logRecord{err: nil, msg: fmt.Sprintf("Duplicate SensorID on line: %d  and  %d", i, sensorId[streamRes.SensorID])})
+		if _, ok := sensorId[streamRes.GetID()]; ok {
+			logRecs = append(logRecs, internal.LogRecord{Err: nil, Msg: fmt.Sprintf("Duplicate SensorID on line: %d  and  %d", i, sensorId[streamRes.GetID()])})
 		} else {
-			sensorId[streamRes.SensorID] = i
+			sensorId[streamRes.GetID()] = i
 		}
 	}
+	_ = bar.Add(remainder)
+	fmt.Println()
 	if !issue {
 		fmt.Println("")
 		log.Logger.Info().Msg("Syntax is valid")
 	}
 	if len(logRecs) > 0 {
-		printLogRecord(logRecs)
+		fmt.Println("")
+		internal.PrintLogRecord(logRecs)
 	}
 }

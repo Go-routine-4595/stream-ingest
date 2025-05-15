@@ -1,11 +1,34 @@
+// Package cosmos
+// -----------------------------------------------------------------------------
+// File: repository.go
+// Description: This file implements the CLI command(s) for ingesting stream
+//
+//				into FCTS.
+//
+//	            Main function create the CosmosDB object and manges batch for
+//				Created/Updated/Deleted streams and is able to generate
+//				list of streams that was not successfully process
+//				so we have trace of what were not processed
+//
+// Author: <Christophe Buffard>
+// Created: <01/15/2025>
+// -----------------------------------------------------------------------------
+// Notes:
+//   - This file is part of the FCTS/stream ingestion project.
+//   - Updated/reliable documentation and usage examples can be found at:
+//     <Link to project README or documentation>
+//
+// -----------------------------------------------------------------------------
 package cosmos
 
 import (
 	"context"
 	"encoding/json"
-	"errors"
-	"githb.com/Go-routine-4595/stream-ingest/domain/stream"
-	"net/http"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/runtime"
+
+	"fmi/stream-ingest/domain/constant"
+	"fmi/stream-ingest/domain/stream"
+	"fmi/stream-ingest/internal"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/data/azcosmos"
 	"github.com/rs/zerolog/log"
@@ -14,9 +37,36 @@ import (
 type Repository struct {
 	Client    *azcosmos.Client
 	Container *azcosmos.ContainerClient
+
+	streamsToCreate map[string]BatchProcessing
+	streamsToUpdate map[string]BatchProcessing
+	streamsToDelete map[string]BatchProcessing
 }
 
-func NewRespository() Repository {
+func NewRepository(instance string) *Repository {
+	var (
+		accountKey      string
+		accountEndpoint string
+		databaseName    string
+		containerName   string
+	)
+	switch instance {
+	case "DevP":
+		accountKey = accountKeyP
+		accountEndpoint = accountEndpointP
+		databaseName = databaseNameP
+		containerName = containerNameP
+	case "Dev":
+		accountKey = accountKeyDev
+		accountEndpoint = accountEndpointDev
+		databaseName = databaseNameDev
+		containerName = containerNameDev
+	case "Prod":
+		accountKey = accountKeyProd
+		accountEndpoint = accountEndpointProd
+		databaseName = databaseNameProd
+		containerName = containerNameProd
+	}
 	// Create a credential
 	cred, err := azcosmos.NewKeyCredential(accountKey)
 	if err != nil {
@@ -32,14 +82,118 @@ func NewRespository() Repository {
 	// Specify the database and container
 	container, _ := client.NewContainer(databaseName, containerName)
 
-	return Repository{
-		Client:    client,
-		Container: container,
+	return &Repository{
+		Client:          client,
+		Container:       container,
+		streamsToCreate: make(map[string]BatchProcessing),
+		streamsToUpdate: make(map[string]BatchProcessing),
+		streamsToDelete: make(map[string]BatchProcessing),
 	}
 }
 
+// GetDataBatchBySideCode retrieves a batch of data filtered by the specified siteCode and data type asynchronously.
+// It executes a query on the Cosmos DB container and sends the resulting items to the provided channel.
+func (r *Repository) GetDataBatchBySideCode(siteCode string, ch chan<- []byte, dataT string, ctx context.Context) {
+	query := "SELECT * FROM c WHERE c.registryType = @type"
+
+	partitionKey := azcosmos.NewPartitionKeyString(siteCode)
+
+	params := []azcosmos.QueryParameter{
+		{Name: "@type", Value: dataT},
+	}
+	queryOptions := &azcosmos.QueryOptions{
+		QueryParameters: params,
+	}
+	pager := r.Container.NewQueryItemsPager(query, partitionKey, queryOptions)
+	go getPageData(pager, ch, ctx)
+
+}
+
+// getPageData retrieves and processes pages of data from a Cosmos DB query asynchronously, sending items to a channel.
+// It iterates through the pager, handles errors, and manages context cancellation to ensure clean termination.
+// The function closes the channel after all items have been sent or if the context is canceled.
+func getPageData(pager *runtime.Pager[azcosmos.QueryItemsResponse], ch chan<- []byte, ctx context.Context) {
+
+	for pager.More() {
+		page, err := pager.NextPage(ctx)
+		if err != nil {
+			log.Logger.Fatal().Msgf("Failed to query items: %v", err)
+			close(ch)
+			return
+		}
+		for _, item := range page.Items {
+			ch <- item
+			select {
+			case <-ctx.Done():
+				close(ch)
+				return
+			default:
+			}
+		}
+	}
+	close(ch)
+	return
+}
+
+// GetStreamBatchBySideCode retrieves a batch of streams filtered by the given site code and sends them to a channel.
+// siteCode specifies the partition key used for filtering streams.
+// ch is the channel to which the retrieved streams are sent.
+// Returns an error if the operation fails.
+func (r *Repository) GetStreamBatchBySideCode(siteCode string, ch chan<- stream.Stream) context.CancelFunc {
+
+	query := "SELECT * FROM c WHERE c.registryType = 'stream'"
+
+	partitionKey := azcosmos.NewPartitionKeyString(siteCode)
+
+	//queryOptions := &azcosmos.QueryOptions{
+	//	PageSizeHint: maxOperations,
+	//}
+	pager := r.Container.NewQueryItemsPager(query, partitionKey, nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	go getPage(pager, ch, ctx)
+
+	return cancel
+}
+
+// getPage retrieves pages of items from a runtime.Pager and sends unmarshalled stream.Stream objects into a channel.
+// pager is the runtime.Pager used to fetch the query results.
+// ch is the channel to which retrieved stream.Stream objects are sent.
+// ctx is the context used to manage request lifetimes and cancellations.
+// Closes the channel after processing all pages or upon encountering an error. Logs errors and terminates on failure.
+func getPage(pager *runtime.Pager[azcosmos.QueryItemsResponse], ch chan<- stream.Stream, ctx context.Context) {
+
+	for pager.More() {
+		page, err := pager.NextPage(ctx)
+		if err != nil {
+			log.Logger.Fatal().Msgf("Failed to query items: %v", err)
+			close(ch)
+			return
+		}
+		for _, item := range page.Items {
+			var (
+				streamEl stream.Stream
+			)
+			err = json.Unmarshal(item, &streamEl)
+			if err != nil {
+				log.Logger.Fatal().Msgf("Failed to unmarshal item: %v", err)
+				close(ch)
+				return
+			}
+			ch <- streamEl
+			select {
+			case <-ctx.Done():
+				close(ch)
+				return
+			default:
+			}
+		}
+	}
+	close(ch)
+	return
+}
+
 // GetStreamByStreamIdAndSiteCode retrieves a stream from the repository using the provided stream ID. Returns the stream or an error.
-func (r Repository) GetStreamByStreamIdAndSiteCode(sensorId string, siteCode string) ([]stream.Stream, error) {
+func (r *Repository) GetStreamByStreamIdAndSiteCode(sensorId string, siteCode string) ([]stream.Stream, error) {
 	// Query items (example query: SELECT * FROM c WHERE c.id = '1')
 	// query := "SELECT * FROM c WHERE c.id = @id"
 	query := "SELECT * FROM c WHERE c.sensorId = @id"
@@ -78,143 +232,72 @@ func (r Repository) GetStreamByStreamIdAndSiteCode(sensorId string, siteCode str
 	return streams, nil
 }
 
-func (r Repository) UpdateStreamsByStreamKey(streams []stream.Stream) []error {
-	var errs []error
-
-	for _, streamEle := range streams {
-		itemData, err := json.Marshal(streamEle)
-		if err != nil {
-			//log.Logger.Debug().Msgf("Failed to marshal item: %v", err)
-			lerr := errors.Join(errors.New("failed to marshal item in repository UpdateStreamsByStreamKey"), err)
-			errs = append(errs, lerr)
-		}
-		// create a context
-		ctx := context.TODO()
-
-		pk := azcosmos.NewPartitionKeyString(streamEle.SiteCode)
-		itemResponse, err := r.Container.ReplaceItem(ctx, pk, streamEle.ID, itemData, nil)
-		_ = itemResponse
-		if err != nil {
-			//log.Logger.Debug().Msgf("Failed to insert item: %v", err)
-			lerr := errors.Join(errors.New("failed to insert item in repository UpdateStreamsByStreamKey"), err)
-			errs = append(errs, lerr)
-		}
-		//log.Logger.Debug().Msgf("Item created with ETag: %v\n", itemResponse.ETag)
+// GetConstantByNameAndSiteCode retrieves a stream from the repository using the provided stream ID. Returns the stream or an error.
+func (r *Repository) GetConstantByNameAndSiteCode(sensorId string, siteCode string) ([]constant.Constant, error) {
+	// Query items (example query: SELECT * FROM c WHERE c.id = '1')
+	// query := "SELECT * FROM c WHERE c.id = @id"
+	query := "SELECT * FROM c WHERE c.streamName = @id"
+	//query := "SELECT * FROM c"
+	params := []azcosmos.QueryParameter{
+		{Name: "@id", Value: sensorId},
 	}
 
-	return errs
+	queryOptions := &azcosmos.QueryOptions{
+		QueryParameters: params,
+	}
+
+	partitionKey := azcosmos.NewPartitionKeyString(siteCode)
+
+	// Define a context
+	ctx := context.TODO()
+
+	pager := r.Container.NewQueryItemsPager(query, partitionKey, queryOptions)
+	consts := make([]constant.Constant, 0)
+
+	for pager.More() {
+		page, err := pager.NextPage(ctx)
+		if err != nil {
+			log.Logger.Fatal().Msgf("Failed to query items: %v", err)
+		}
+
+		for _, item := range page.Items {
+			var constEl constant.Constant
+			err = json.Unmarshal(item, &constEl)
+			if err != nil {
+				log.Logger.Fatal().Msgf("Failed to unmarshal item: %v", err)
+			}
+			consts = append(consts, constEl)
+		}
+	}
+	return consts, nil
 }
 
-func (r Repository) CreatStreamsByStreamKey(streams []stream.Stream) []error {
-	var errs []error
+func (r *Repository) Close() ([]Batcher, []internal.LogRecord) {
+	var (
+		errs          []internal.LogRecord = make([]internal.LogRecord, 0)
+		streamsIssues []Batcher            = make([]Batcher, 0)
+	)
 
-	for _, streamEle := range streams {
-		itemData, err := json.Marshal(streamEle)
-		if err != nil {
-			//log.Logger.Debug().Msgf("Failed to marshal item: %v", err)
-			lerr := errors.Join(errors.New("failed to marshal item in repository UpdateStreamsByStreamKey"), err)
-			errs = append(errs, lerr)
-		}
-		// create a context
-		ctx := context.TODO()
-
-		pk := azcosmos.NewPartitionKeyString(streamEle.SiteCode)
-		itemResponse, err := r.Container.CreateItem(ctx, pk, itemData, nil)
-		_ = itemResponse
-		if err != nil {
-			//log.Logger.Debug().Msgf("Failed to insert item: %v", err)
-			lerr := errors.Join(errors.New("failed to insert item in repository UpdateStreamsByStreamKey"), err)
-			errs = append(errs, lerr)
-		}
-		//log.Logger.Debug().Msgf("Item created with ETag: %v\n", itemResponse.ETag)
-	}
-
-	return errs
-}
-
-func (r Repository) CreatBatchedStreamsByStreamKey(streams []stream.Stream) []error {
-	var errs []error
-
-	batches, _, err := makeBatches(streams, 100)
-	if err != nil {
-		return []error{err}
-	}
-
-	for site, batch := range batches {
-		pk := azcosmos.NewPartitionKeyString(site)
-		batchDB := r.Container.NewTransactionalBatch(pk)
-		for _, item := range batch {
-			batchDB.CreateItem(item, nil)
-		}
-
-		ctx := context.TODO()
-
-		resp, err := r.Container.ExecuteTransactionalBatch(ctx, batchDB, nil)
-		if err != nil {
-			return []error{err}
-		}
-		for _, op := range resp.OperationResults {
-			if op.StatusCode != http.StatusCreated {
-				lerr := errors.Join(errors.New("failed to create item in repository CreatBatchedStreamsByStreamKey"), err)
-				errs = append(errs, lerr)
-			}
+	if len(r.streamsToCreate) > 0 {
+		for siteCode, _ := range r.streamsToCreate {
+			resStreamIssues, resErrLog := r.executeCreateBatchedStreamsByStreamKey(siteCode)
+			errs = append(errs, resErrLog...)
+			streamsIssues = append(streamsIssues, resStreamIssues...)
 		}
 	}
-
-	return errs
-}
-
-/ makeBatches groups a slice of streams by siteCode, splits them into smaller batches of the specified size, and returns:
-// - A map[string][][]byte where the key is siteCode and the value is a set of marshaled batches.
-// - A map[string][][]string where the key is siteCode and the value is a set of batches containing stream IDs.
-func makeBatches(streams []stream.Stream, batchSize int) (map[string][][]byte, map[string][][]string, error) {
-	// Step 1: Group streams by siteCode
-	grouped := make(map[string][]stream.Stream)
-	for _, streamItem := range streams {
-		grouped[streamItem.SiteCode] = append(grouped[streamItem.SiteCode], streamItem)
-	}
-
-	marshaledResults := make(map[string][][]byte)
-	idsResults := make(map[string][][]string)
-
-	// Step 2: Create batches for each siteCode
-	for siteCode, siteStreams := range grouped {
-		var marshaledBatches [][]byte
-		var idBatches [][]string
-
-		for i := 0; i < len(siteStreams); i += batchSize {
-			end := i + batchSize
-			if end > len(siteStreams) {
-				end = len(siteStreams)
-			}
-			batch := siteStreams[i:end]
-
-			// Step 3a: Marshal the batch
-			for _, item := range batch {
-
-				marshaledBatch, err := json.Marshal(item)
-				if err != nil {
-					return nil, nil, err
-				}
-				marshaledBatches = append(marshaledBatches, marshaledBatch)
-			}
-
-			// Step 3b: Extract IDs from the batch
-			var idBatch []string
-			for _, item := range batch {
-				idBatch = append(idBatch, item.ID)
-			}
-			idBatches = append(idBatches, idBatch)
+	if len(r.streamsToUpdate) > 0 {
+		for siteCode, _ := range r.streamsToUpdate {
+			resStreamIssues, resErrLog := r.executeUpdateBatchedStreamsByStreamKey(siteCode)
+			errs = append(errs, resErrLog...)
+			streamsIssues = append(streamsIssues, resStreamIssues...)
 		}
-
-		// Step 4: Store results in maps
-		marshaledResults[siteCode] = marshaledBatches
-		idsResults[siteCode] = idBatches
 	}
-
-	return marshaledResults, idsResults, nil
-}
-
-func (r Repository) Close() {
-
+	if len(r.streamsToDelete) > 0 {
+		for siteCode, _ := range r.streamsToDelete {
+			resStreamIssues, resErrLog := r.executeDeleteBatchedStreamsByStreamKey(siteCode)
+			errs = append(errs, resErrLog...)
+			streamsIssues = append(streamsIssues, resStreamIssues...)
+		}
+	}
+	return streamsIssues, errs
 }

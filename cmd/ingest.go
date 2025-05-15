@@ -1,18 +1,18 @@
 package cmd
 
 import (
+	"encoding/json"
+	"errors"
+	"fmi/stream-ingest/domain/base"
+	"fmi/stream-ingest/internal"
+	"fmi/stream-ingest/model"
+	"fmi/stream-ingest/repository/cosmos"
+	"fmi/stream-ingest/repository/dataprocessor"
 	"fmt"
-	"githb.com/Go-routine-4595/stream-ingest/model"
 	"io"
-	"os"
-	"time"
-
-	"githb.com/Go-routine-4595/stream-ingest/domain/stream"
-	"githb.com/Go-routine-4595/stream-ingest/repository/cosmos"
-	"githb.com/Go-routine-4595/stream-ingest/repository/dataprocessor"
+	"strings"
 
 	"github.com/rs/zerolog/log"
-	"github.com/schollz/progressbar/v3"
 	"github.com/spf13/cobra"
 )
 
@@ -20,192 +20,440 @@ import (
 var ingestCmd = &cobra.Command{
 	Use:   "ingest [file]",
 	Short: "Ingest data from the given file into the database",
-	Args:  cobra.ExactArgs(1), // Expect exactly one argument (file)
+	Long: `Ingest data from the given file into the database.
+input file format for new streams:
+- SiteCode | SensorId | StreamName | Process | ScaleFactor | MinValue | MaxValue | LoLo | Lo | Hi | HiHi | Uom 
+input file format for new constants:
+- SiteCode | ConstantName | Value | Process | MinValue | MaxValue | LoLo | Lo | Hi | HiHi | Uom 
+All numeric values are optional, and will be defaulted to 0 if not provided:
+- ScaleFactor: 1.0
+- MinValue: 0
+- MaxValue: 0
+- LoLo: 0
+- Lo: 0
+- Hi: 0
+- HiHi: 0
+Supported Tags:
+CollarElevation | EquipmentClass| EquipmentComponent | EquipmentMeasurement
+EquipmentName | EquipmentSubUnit | EquipmentType | EquipmentUnit | GaugeFactor
+GPSLatitude | GPSLongitude | Interpolation | OpStatsLoader | SAPEquipmentID | SAPMeasurementID
+SAPMeasurementType | SAPUOM | Scaling | SensorElevation | SIMS | System | UDE | Workflow
+ZeroReading | SAPSiteCode | OEM | Severity
+SiteCode is the 3 letters site code used in FCTS (BAG/MOR/...)
+the --skip flag is optional, it is used to skip the check for existence of streams /!\`,
+	Example: `ingest -u 12345678 ./data/streams.csv`,
+	Args:    cobra.ExactArgs(1),
 	Run: func(cmd *cobra.Command, args []string) {
-		file := args[0]
-		update, _ := cmd.Flags().GetBool("update") // Get the value of the "update" flag
-		user, _ := cmd.Flags().GetString("user")
-		fmt.Printf("Ingesting data from file: %s\n", file)
-		if update {
-			fmt.Println("Update flag is set: Updating existing data in the database.")
-		} else {
-			fmt.Println("Ingesting new data only.")
+		options := parseCommandOptions(cmd, args)
+
+		if !confirmUserAction(options) {
+			return
 		}
-		// Call your logic to ingest the data here
-		executeIngest(file, update, user)
+
+		fmt.Printf("Ingesting data from file: %s\n", options.file)
+		if options.skip {
+			fmt.Println("Skipping check for existence of streams!")
+		}
+
+		if options.experimental {
+			fmt.Println("Experimental mode, will be removed in the future, use with caution")
+			if options.site == "" {
+				fmt.Println("experimental option needs a site code")
+				return
+			}
+			executeIngestAsynch(options)
+		} else {
+			executeIngest(options)
+		}
 	},
 }
 
-func init() {
-	// Add the "ingest" command and define its flag
-	ingestCmd.Flags().Bool("update", false, "Update existing data in the database")
-	ingestCmd.Flags().StringP("user", "u", "", "employee id")
+// CommandOptions holds all command line options
+type IngestCommandOptions struct {
+	file         string
+	user         string
+	skip         bool
+	debug        bool
+	instance     string
+	verbose      bool
+	site         string
+	experimental bool
+}
 
-	// Mark the "user" flag as required
+// IngestHandlers holds all file handlers used during ingestion
+type IngestHandlers struct {
+	persistedUnprocessed *dataprocessor.CSVPersist
+	debugNewStreams      *internal.DebugData
+	debugUpdatedStreams  *internal.DebugData
+	streamBackupSaver    *dataprocessor.FileSaver
+}
+
+func parseCommandOptions(cmd *cobra.Command, args []string) IngestCommandOptions {
+	user, _ := cmd.Flags().GetString("user")
+	skip, _ := cmd.Flags().GetBool("skip")
+	debug, _ := cmd.Flags().GetBool("debug")
+	prod, _ := cmd.Flags().GetBool("prod")
+	verb, _ := cmd.Flags().GetBool("verbose")
+	repeat, _ := cmd.Flags().GetBool("repeat")
+	exp, _ := cmd.Flags().GetBool("experimental")
+	site := cmd.Flag("site").Value.String()
+
+	// Ensure user ID is at least 10 characters
+	if len(user) < 10 {
+		user = strings.Repeat("0", 10-len(user)) + user
+	}
+
+	// Determine environment instance
+	instance := "Dev"
+	if prod {
+		instance = "Prod"
+	}
+
+	// Handle OEM tag settings
+	if repeat {
+		base.SetOEMTagInfo(true)
+	}
+	con, rep := base.GetOEMTagInfo()
+	fmt.Printf("You are using the OEM tag with :\"%s\" constraint and a repeat set to: \"%t\" \n", con, rep)
+
+	return IngestCommandOptions{
+		file:         args[0],
+		user:         user,
+		skip:         skip,
+		debug:        debug,
+		instance:     instance,
+		verbose:      verb,
+		site:         site,
+		experimental: exp,
+	}
+}
+
+func confirmUserAction(options IngestCommandOptions) bool {
+	// Confirm main action
+	question := fmt.Sprintf("Your are about to ingest data from file into %s DB, are you sure? (y/N) : ", options.instance)
+	if !isUserOk(question, "") {
+		return false
+	}
+
+	// Confirm skip option if selected
+	if options.skip {
+		if !isUserOk("The stream will be ingested without checking if the stream already exists in the database, are you sure? (y/N) : ",
+			"Skipping check for existence of streams!") {
+			options.skip = false
+		}
+	}
+
+	return true
+}
+
+func init() {
+	ingestCmd.Flags().StringP("user", "u", "", "employee id")
+	ingestCmd.Flags().BoolP("skip", "s", false, "skip check for existence of streams use only if you are sure the streams are NOT already in the database /!\\ ")
+	ingestCmd.Flags().BoolP("debug", "d", false, "debug mode, will save all UUID (id) of updated streams, created streams in 2 different log files and backup the streams before updating them.")
+	ingestCmd.Flags().BoolP("prod", "p", false, "ingest data into the production CosmosDB, default import in the Dev CosmosDB.")
+	ingestCmd.Flags().BoolP("verbose", "v", false, "verbose mode, will print all log messages.")
+	ingestCmd.Flags().BoolP("repeat", "r", false, "used to concatenate a OEM tag to the stream if the tag already exists in the stream (useful for importing large number of OEM tag exceeding the excel cell limit)")
+	ingestCmd.Flags().BoolP("experimental", "e", false, "experimental asynch batch ingestion, will be removed in the future, use with caution")
+	ingestCmd.Flags().String("site", "", "Site 3 letter code")
 	err := ingestCmd.MarkFlagRequired("user")
 	if err != nil {
 		log.Logger.Err(err).Msg("Failed to mark the 'user' flag as required")
 	}
-
 	rootCmd.AddCommand(ingestCmd)
 }
 
-func executeIngest(file string, update bool, user string) {
+func executeIngest(options IngestCommandOptions) {
+	// Setup resources
+	registry, reader, logRecords, handlers := setupIngestResources(options)
+	if registry == nil || reader == nil {
+		return
+	}
+
+	// Close resources when done
+	defer closeResources(reader, handlers)
+
+	// Process data
+	processCsvData(registry, reader, options, handlers, logRecords)
+}
+
+// setupIngestResources initializes all necessary resources for ingestion
+func setupIngestResources(options IngestCommandOptions) (*model.Registry, *dataprocessor.CSVReader,
+	[]internal.LogRecord, *IngestHandlers) {
+
 	var (
-		err                error
-		newStream          *stream.Stream
-		fetchedStreams     []stream.Stream
-		unprocessedStreams []stream.Stream
-		streamsToCreate    []stream.Stream
-		streamsToUpdate    []stream.Stream
-		reader             *dataprocessor.CSVReader
-		repo               cosmos.Repository
-		persite            dataprocessor.CSVPersist
-		lineNumber         int
-		bar                *progressbar.ProgressBar
-		LogRecords         []logRecord
-		sensorId           map[string]int
-		resFile            string
+		err        error
+		logRecords []internal.LogRecord
+		handlers   = &IngestHandlers{}
 	)
 
-	reader, err = dataprocessor.NewCSVReader(file, user)
+	// Initialize registry from file
+	registry, err := model.NewRegistry(options.file)
 	if err != nil {
-		log.Logger.Err(err)
-		return
+		fmt.Printf("unrecognized csv header: %v \n", err)
+		return nil, nil, logRecords, handlers
 	}
 
-	resFile = getFileName("import-result")
-	persite, err = dataprocessor.NewCSVPersist(resFile)
+	// Initialize CSV reader
+	reader, err := dataprocessor.NewCSVReader(options.file, options.user, registry.GetHeaders())
 	if err != nil {
-		log.Logger.Err(err)
-		return
+		if errors.Is(err, dataprocessor.UnknownTagErr) {
+			log.Logger.Err(err).Msg("unknown tag in the CSV file")
+			if !isUserOk("Do you want to continue anyway? (y/N) : ", "new tag will be created") {
+				return nil, nil, logRecords, handlers
+			}
+		} else {
+			log.Logger.Err(err).Msg("failed to create reader")
+			return nil, nil, logRecords, handlers
+		}
 	}
 
-	defer reader.Close()
-	defer persite.Close()
+	// Setup result file for unprocessed streams
+	resFile := getFileNameCsv("import-result")
+	persisteUnprocessedStreams, err := dataprocessor.NewCSVPersist(resFile, reader.GetHeaders(), 4096)
+	if err != nil {
+		log.Logger.Err(err)
+		return nil, nil, logRecords, handlers
+	}
+	handlers.persistedUnprocessed = persisteUnprocessedStreams
 
-	repo = cosmos.NewRespository()
+	// Setup debug handlers if debug mode is enabled
+	if options.debug {
+		if !setupDebugHandlers(handlers) {
+			return nil, nil, logRecords, handlers
+		}
+	}
 
-	unprocessedStreams = make([]stream.Stream, 0)
-	streamsToCreate = make([]stream.Stream, 0)
-	streamsToUpdate = make([]stream.Stream, 0)
-	sensorId = make(map[string]int)
+	return registry, reader, logRecords, handlers
+}
 
-	lineNumber, err = reader.CountLines()
-	bar = progressBar(lineNumber, "Processing file "+file+"...")
+// setupDebugHandlers initializes handlers for debug information
+func setupDebugHandlers(handlers *IngestHandlers) bool {
+	var err error
+
+	// Setup handler for new streams
+	handlers.debugNewStreams, err = internal.NewDebugData(getFileNameJson("stream-id-new"), 4096)
+	if err != nil {
+		log.Logger.Err(err).Msg("failed to create debug data")
+		return false
+	}
+
+	// Setup handler for updated streams
+	handlers.debugUpdatedStreams, err = internal.NewDebugData(getFileNameJson("stream-id-updated"), 4096)
+	if err != nil {
+		log.Logger.Err(err).Msg("failed to create debug data")
+		return false
+	}
+
+	// Setup handler for stream backups
+	handlers.streamBackupSaver, err = dataprocessor.NewFileSaver(getFileNameJson("streams-backup"), 4096)
+	if err != nil {
+		log.Logger.Err(err).Msg("failed to create debug data")
+		return false
+	}
+
+	return true
+}
+
+// closeResources ensures all resources are properly closed
+func closeResources(reader *dataprocessor.CSVReader, handlers *IngestHandlers) {
+	reader.Close()
+
+	if handlers.persistedUnprocessed != nil {
+		handlers.persistedUnprocessed.Close()
+	}
+
+	if handlers.debugNewStreams != nil {
+		handlers.debugNewStreams.Close()
+	}
+
+	if handlers.debugUpdatedStreams != nil {
+		handlers.debugUpdatedStreams.Close()
+	}
+
+	if handlers.streamBackupSaver != nil {
+		handlers.streamBackupSaver.Close()
+	}
+}
+
+// processCsvData reads and processes each line from the CSV file
+func processCsvData(registry *model.Registry, reader *dataprocessor.CSVReader,
+	options IngestCommandOptions, handlers *IngestHandlers, logRecords []internal.LogRecord) {
+
+	// Initialize repository and tracking
+	repo := cosmos.NewRepository(options.instance)
+	sensorIdMap := make(map[string]int)
+
+	// Setup progress bar
+	lineNumber, err := reader.CountLines()
+	bar, bucket, _ := progressBar(lineNumber, "Processing file "+options.file)
 	defer bar.Finish()
 
-	//Skipe the first line (header)
-	_, _ = reader.ReadNext()
+	// Skip header line
+	err = reader.SkipLine()
+	if err != nil {
+		logRecords = append(logRecords, internal.LogRecord{Err: err, Msg: "Failed to skip header line"})
+		return
+	}
 
+	// Process each line
 	for i := 2; ; i++ {
-		bar.Add(1)
-		newStream, err = reader.ReadNext()
-		if err != nil {
-			if err == io.EOF {
-				break
-			}
-			LogRecords = append(LogRecords, logRecord{err: err, msg: fmt.Sprintf("Failed to read next stream line: %d", i)})
-			return
-		}
-		// check is a row had the same sensorId we already processed in the file
-		// SensorID is the primaryKey
-		if _, ok := sensorId[newStream.SensorID]; ok {
-			LogRecords = append(LogRecords, logRecord{err: nil, msg: fmt.Sprintf("Duplicate SensorID on line: %d  and  %d", i, sensorId[newStream.SensorID])})
-			continue
-		} else {
-			sensorId[newStream.SensorID] = i
-		}
-		// fetchStreams in DB for the stream we just created, is the stream already existing?
-		fetchedStreams, err = repo.GetStreamByStreamIdAndSiteCode(newStream.SensorID, newStream.SiteCode)
-		if err != nil {
-			LogRecords = append(LogRecords, logRecord{err: err, msg: "Failed to get stream"})
-			unprocessedStreams = append(unprocessedStreams, *newStream)
-			continue
-		}
-		// we found multiple steram with the same SensorID this should not append...
-		if len(fetchedStreams) > 1 {
-			LogRecords = append(LogRecords, logRecord{err: err, msg: fmt.Sprintf("More than one stream found in the Registry for %s at line %d in file %s", newStream.SensorID, i, file)})
-			unprocessedStreams = append(unprocessedStreams, *newStream)
-			continue
+		if i%bucket == 0 {
+			_ = bar.Add(bucket)
 		}
 
-		// if the stream exists we might need to update it
-		if len(fetchedStreams) == 1 {
-			if !stream.CompareStreams(fetchedStreams[0], *newStream) {
-				LogRecords = append(LogRecords, logRecord{err: nil, msg: fmt.Sprintf("Registry streamId: %s need to be updated by file: %s row line: %d ", fetchedStreams[0].SensorID, file, i)})
-				updateStream(update, &fetchedStreams[0], newStream, user)
-				streamsToUpdate = append(streamsToUpdate, fetchedStreams[0])
-			}
-			continue
+		// Process individual stream
+		if !processStreamLine(registry, reader, repo, sensorIdMap, i, options, handlers, &logRecords) {
+			break // End of file or fatal error
 		}
-		// no stream exist simple we create it
-		if len(fetchedStreams) == 0 {
-			streamsToCreate = append(streamsToCreate, *newStream)
-		}
-	}
-	// Now we add our stream in the DB
-	if len(streamsToCreate) > 0 {
-		errs := repo.CreatStreamsByStreamKey(streamsToCreate)
-		if len(errs) > 0 {
-			addError(&LogRecords, errs, "failed to create stream")
-		}
-	}
-	// Now we update stream in the DB
-	if len(streamsToUpdate) > 0 {
-		errs := repo.UpdateStreamsByStreamKey(streamsToUpdate)
-		if len(errs) > 0 {
-			addError(&LogRecords, errs, "failed to create stream")
-		}
-	}
-	// if we have unpocessed stream we need to let know the user
-	// with a new CSV file
-	if len(unprocessedStreams) > 0 {
-		processUnProcessed(persite, unprocessedStreams, &LogRecords)
-	} else {
-		_ = deleteFile(resFile)
-	}
-	printLogRecord(LogRecords)
-}
-
-func updateStream(update bool, stream1 *stream.Stream, stream2 *stream.Stream, user string) {
-	if update {
-		stream.UpdateStream(stream1, stream2, user)
-	} else {
-		stream.UpdateTags(stream1, stream2, user)
 	}
 }
 
-func processUnProcessed(p dataprocessor.CSVPersist, unprocessed []stream.Stream, records *[]logRecord) {
-	var items []model.Item
+// processStreamLine processes a single stream from the CSV
+func processStreamLine(registry *model.Registry, reader *dataprocessor.CSVReader,
+	repo *cosmos.Repository, sensorIdMap map[string]int, lineNum int,
+	options IngestCommandOptions, handlers *IngestHandlers, logRecords *[]internal.LogRecord) bool {
 
-	items = make([]model.Item, len(unprocessed))
-
-	for i, streamS := range unprocessed {
-		item := streamS.ConvertStreamToItem()
-		items[i] = item
-	}
-	err := p.Persist(items)
+	// Create new stream element
+	newStream := registry.NewElement(options.user)
+	err := reader.ReadNext(newStream)
 	if err != nil {
-		*records = append(*records, logRecord{err: err, msg: "Failed to persist"})
+		if err == io.EOF {
+			return false // End of file
+		}
+		*logRecords = append(*logRecords, internal.LogRecord{
+			Err: err,
+			Msg: fmt.Sprintf("Failed to read stream line: %d in file: %s", lineNum, options.file),
+		})
+		return true // Continue to next line
 	}
 
+	// Check for duplicate sensor IDs
+	if existingLine, ok := sensorIdMap[newStream.GetID()]; ok {
+		*logRecords = append(*logRecords, internal.LogRecord{
+			Err: nil,
+			Msg: fmt.Sprintf("Duplicate SensorID on line: %d and %d", lineNum, existingLine),
+		})
+		return true // Continue to next line
+	}
+
+	sensorIdMap[newStream.GetID()] = lineNum
+
+	// Process the stream
+	if !options.skip {
+		processExistingStream(newStream, repo, registry, options, handlers, logRecords)
+	} else {
+		processNewStream(newStream, repo, handlers, logRecords)
+	}
+
+	return true
 }
 
-// getCurrentTimestamp returns the current date and time in the format YYYYMMDDHHMMSS.
-func getCurrentTimestamp() string {
-	return time.Now().Format("20060102150405")
-}
+// processExistingStream handles updating of existing streams
+func processExistingStream(stream model.RegistryInterface, repo *cosmos.Repository,
+	registry *model.Registry, options IngestCommandOptions, handlers *IngestHandlers,
+	logRecords *[]internal.LogRecord) {
 
-func getFileName(file string) string {
-	return file + "_" + getCurrentTimestamp() + ".csv"
-}
-
-// deleteFile removes the specified file and returns an error if it fails.
-func deleteFile(filePath string) error {
-	err := os.Remove(filePath)
+	fetchedStreams, err := registry.GetElementFromRepo(repo, stream.GetID(), stream.GetSiteCode())
 	if err != nil {
-		return fmt.Errorf("failed to delete file %s: %w", filePath, err)
+		*logRecords = append(*logRecords, internal.LogRecord{Err: err, Msg: "Failed to get stream"})
+		return
 	}
-	return nil
+
+	// Backup streams in debug mode
+	if options.debug && handlers.streamBackupSaver != nil {
+		backupStreams(fetchedStreams, handlers.streamBackupSaver)
+	}
+
+	// Handle multiple streams found
+	if len(fetchedStreams) > 1 {
+		handleMultipleStreams(fetchedStreams, stream, options, logRecords)
+	}
+
+	// Update existing stream
+	if len(fetchedStreams) >= 1 {
+		updateExistingStream(fetchedStreams[0], stream, options.user, repo, handlers, logRecords)
+		return
+	}
+
+	// Create new stream if none found
+	processNewStream(stream, repo, handlers, logRecords)
+}
+
+// backupStreams saves stream data for debug purposes
+func backupStreams(streams []model.RegistryInterface, saver *dataprocessor.FileSaver) {
+	for _, stream := range streams {
+		streamJson, _ := json.Marshal(stream)
+		_ = saver.Write(streamJson)
+	}
+}
+
+// handleMultipleStreams handles the case when multiple streams are found
+func handleMultipleStreams(fetchedStreams []model.RegistryInterface, newStream model.RegistryInterface,
+	options IngestCommandOptions, logRecords *[]internal.LogRecord) {
+
+	*logRecords = append(*logRecords, internal.LogRecord{
+		Err: nil,
+		Msg: fmt.Sprintf("More than one stream found in the Registry for \"%s\" - the first stream will be updated",
+			newStream.GetID()),
+	})
+
+	if options.debug {
+		for _, fetchedStream := range fetchedStreams {
+			*logRecords = append(*logRecords, internal.LogRecord{
+				Err: errors.New("multiple stream defined"),
+				Msg: fmt.Sprintf("sensorId: \"%s\" stream.ID: \"%s\"",
+					fetchedStream.GetID(), fetchedStream.GetInternalID()),
+			})
+		}
+	}
+}
+
+// updateExistingStream updates an existing stream with new data
+func updateExistingStream(existingStream, newStream model.RegistryInterface, user string,
+	repo *cosmos.Repository, handlers *IngestHandlers, logRecords *[]internal.LogRecord) {
+
+	err := existingStream.Validate()
+	if err != nil {
+		*logRecords = append(*logRecords, internal.LogRecord{
+			Err: err,
+			Msg: fmt.Sprintf("Registry stream:\"%s\" in CosmosDB has duplicated tag", existingStream.GetID()),
+		})
+		log.Fatal().Msgf("stream not valid: %v, %+v: ", err, existingStream)
+	}
+
+	// Only update if different
+	if !existingStream.CompareTo(newStream) {
+		existingStream.UpdateWith(newStream, user)
+		unprocessedItems, logErr := repo.UpdateBatchedStreamsByStreamKey(existingStream)
+		*logRecords = append(*logRecords, logErr...)
+
+		// Store unprocessed items
+		if len(unprocessedItems) > 0 && handlers.persistedUnprocessed != nil {
+			_ = handlers.persistedUnprocessed.AddRows(itemsToRowList(unprocessedItems))
+		}
+
+		// Save updated stream ID for debug
+		if handlers.debugUpdatedStreams != nil {
+			_ = handlers.debugUpdatedStreams.Write(existingStream.GetInternalID())
+		}
+	}
+}
+
+// processNewStream creates a new stream
+func processNewStream(newStream model.RegistryInterface, repo *cosmos.Repository,
+	handlers *IngestHandlers, logRecords *[]internal.LogRecord) {
+
+	newStream.ProcessNumericalValue()
+	unprocessedItems, logErr := repo.CreatBatchedStreamsByStreamKey(newStream)
+	*logRecords = append(*logRecords, logErr...)
+
+	// Store unprocessed items
+	if len(unprocessedItems) > 0 && handlers.persistedUnprocessed != nil {
+		_ = handlers.persistedUnprocessed.AddRows(itemsToRowList(unprocessedItems))
+	}
+
+	// Save new stream ID for debug
+	if handlers.debugNewStreams != nil {
+		_ = handlers.debugNewStreams.Write(newStream.GetInternalID())
+	}
 }
