@@ -1,3 +1,36 @@
+// Package cmd
+// -----------------------------------------------------------------------------
+// File: ingestasynch.go
+// Description: This file implements the CLI command(s) for ingesting stream
+//				into FCTS.
+//
+//
+//	            It provides functionalities to interact with the user and
+//	            verify the input streams definition file syntax, check if the
+//				streams already exist, if yes raise error in a log file
+//				import-result_<date>.csv. If the checks are successful, then
+//				the stream will be easier created or updated based on the
+//				import file.
+//				Note: every streams attribute will be updated as follows:
+//				- siteCode is not updated, as it is a partition key in Cosmos
+//				- tag will be added to CosmosDB
+//				- tag will be updated from import file
+//              - this file is experimental, it designed for ingesting constants. It seems that CosmosSB is very slow
+//                querying constants; this new implementation dosen't check if a constant is in CosmosDB before modifying
+//                it. We parse the file of new constant to add/modify to build a map[string]int, the string is the constant
+//                id and the int is the line number in the CSV file. The we batch fetch all constant for a site (i.e. the
+//                CosmosDB partition key) and we check if the constant is in CosmosDB then we update it. If not found we create it
+//
+// Author: <Christophe Buffard>
+// Created: <01/15/2025>
+// -----------------------------------------------------------------------------
+// Notes:
+//   - This file is part of the FCTS/stream ingestion project.
+//   - Updated/reliable documentation and usage examples can be found at:
+//     <Link to project README or documentation>
+//
+// -----------------------------------------------------------------------------
+
 package cmd
 
 import (
@@ -19,31 +52,31 @@ type SensorAtLine struct {
 }
 
 // executeIngestAsynch processes a CSV file and updates or creates sensor records in the database
-func executeIngestAsynch(file, instance, site, user string) {
-	sensorIDMap := getSensorIDMap(file)
+func executeIngestAsynch(options IngestCommandOptions) {
+	sensorIDMap := getSensorIDMap(options.file)
 
 	// Initialize repository
-	repo := cosmos.NewRepository(instance)
+	repo := cosmos.NewRepository(options.instance)
 	defer func() {
 		unprocessedItems, _ := repo.Close()
 		handleUnprocessedItems(unprocessedItems)
 	}()
 
 	// Initialize data registry and reader
-	data, reader, err := initializeDataAndReader(file, user)
+	data, reader, err := initializeDataAndReader(options.file, options.user)
 	if err != nil {
 		return
 	}
 	defer reader.Close()
 
 	// Process existing data
-	updatedItemCount, err := processExistingData(data, repo, reader, site, sensorIDMap, user)
+	updatedItemCount, err := processExistingData(data, repo, reader, options.site, sensorIDMap, options.user)
 	if err != nil {
 		return
 	}
 
 	// Process new data
-	createdItemCount, err := processNewData(data, reader, repo, sensorIDMap, user)
+	createdItemCount, err := processNewData(data, reader, repo, sensorIDMap, options.user)
 	if err != nil {
 		return
 	}

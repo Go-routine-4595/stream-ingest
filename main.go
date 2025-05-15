@@ -7,7 +7,7 @@ import (
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 
-	"githb.com/Go-routine-4595/stream-ingest/cmd"
+	"fmi/stream-ingest/cmd"
 )
 
 func main() {
